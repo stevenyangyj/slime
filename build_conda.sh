@@ -3,14 +3,12 @@
 set -ex
 
 # create conda
-yes '' | "${SHELL}" <(curl -L micro.mamba.pm/install.sh)
-export PS1=tmp
 mkdir -p /root/.cargo/
 touch /root/.cargo/env
-source ~/.bashrc
 
-micromamba create -n slime python=3.12 pip -c conda-forge -y
-micromamba activate slime
+conda create -n slime python=3.12 pip -c conda-forge -y
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate slime
 export CUDA_HOME="$CONDA_PREFIX"
 export SGLANG_COMMIT="24c91001cf99ba642be791e099d358f4dfe955f5"
 export MEGATRON_COMMIT="3714d81d418c9f1bca4594fc35f9e8289f652862"
@@ -19,8 +17,8 @@ export BASE_DIR=${BASE_DIR:-"/root"}
 cd $BASE_DIR
 
 # install cuda 12.9 as it's the default cuda version for torch
-micromamba install -n slime cuda cuda-nvtx cuda-nvtx-dev nccl -c nvidia/label/cuda-12.9.1 -y
-micromamba install -n slime -c conda-forge cudnn -y
+conda install -n slime cuda cuda-nvtx cuda-nvtx-dev nccl -c nvidia/label/cuda-12.9.1 -y
+conda install -n slime -c conda-forge cudnn -y
 
 # prevent installing cuda 13.0 for sglang
 pip install cuda-python==13.1.0

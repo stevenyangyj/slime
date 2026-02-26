@@ -93,12 +93,13 @@ def _encode_observation_for_generation(
         # Convert content-embedded images/videos into multimodal inputs for the processor.
         from qwen_vl_utils import process_vision_info
 
-        images, videos = process_vision_info([message])
-        multimodal_inputs = {"images": images, "videos": videos}
+        images, _ = process_vision_info([message])
+        multimodal_inputs = {"images": images}
         processor_output = processor(text=formatted_prompt, **multimodal_inputs)
         prompt_ids = processor_output["input_ids"][0]
         multimodal_train_inputs = {
             k: v for k, v in processor_output.items() if k not in ["input_ids", "attention_mask"]
+            and "video" not in k
         } or None
     else:
         prompt_ids = tokenizer.encode(formatted_prompt, add_special_tokens=False)
@@ -157,6 +158,7 @@ def _prepare_initial_inputs(sample: Sample, processor, tokenizer):
         prompt_ids = processor_output["input_ids"][0]
         sample.multimodal_train_inputs = {
             k: v for k, v in processor_output.items() if k not in ["input_ids", "attention_mask"]
+            and "video" not in k
         } or None
     else:
         prompt_ids = tokenizer.encode(sample.prompt, add_special_tokens=False)

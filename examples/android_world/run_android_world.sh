@@ -1,17 +1,19 @@
 #!/bin/bash
 
-# Qwen3 VL RL training on geo3k dataset
+# Android World VLM agent RL training with slime
 # Supports both megatron and fsdp training backends
-# Usage: 
-#   SLIME_SCRIPT_TRAIN_BACKEND=fsdp ./run_geo3k_vlm.sh
-#   SLIME_SCRIPT_MODEL_NAME=Qwen3-VL-2B-Instruct ./run_geo3k_vlm.sh
+# Usage:
+#   bash examples/android_world/run_android_world.sh
+#   SLIME_SCRIPT_TRAIN_BACKEND=megatron bash examples/android_world/run_android_world.sh
+#   SLIME_SCRIPT_MODEL_NAME=Qwen3-VL-8B-Instruct SLIME_SCRIPT_NUM_GPUS=8 bash examples/android_world/run_android_world.sh
+#   SLIME_SCRIPT_EXTERNAL_RAY=1 SLIME_SCRIPT_NUM_NODES=2 SLIME_SCRIPT_NUM_GPUS=8 bash examples/android_world/run_android_world.sh
 
 # Configuration
-TRAIN_BACKEND=${SLIME_SCRIPT_TRAIN_BACKEND:-"megatron"}
-MODEL_NAME=${SLIME_SCRIPT_MODEL_NAME:-"Qwen3-VL-8B-Instruct"}
-DATASET_NAME=${SLIME_SCRIPT_DATASET_NAME:-"chenhegu/geo3k_imgurl"}
+TRAIN_BACKEND=${SLIME_SCRIPT_TRAIN_BACKEND:-"fsdp"}
+MODEL_NAME=${SLIME_SCRIPT_MODEL_NAME:-"Qwen3-VL-2B-Instruct"}
+NUM_NODES=${SLIME_SCRIPT_NUM_NODES:-1}
 NUM_GPUS=${SLIME_SCRIPT_NUM_GPUS:-8}
-DATASET_LOCAL_NAME=$(basename "$DATASET_NAME")
+TASK_DATA=${SLIME_SCRIPT_TASK_DATA:-"examples/android_world/data/tasks.jsonl"}
 
 # Validate MODEL_NAME
 VALID_MODELS="
@@ -45,6 +47,10 @@ else
 fi
 
 # Cleanup
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -x "${SCRIPT_DIR}/cleanup.sh" ]; then
+   bash "${SCRIPT_DIR}/cleanup.sh" 2>/dev/null || true
+fi
 pkill -9 sglang
 sleep 3
 if [ "$USE_EXTERNAL_RAY" = "0" ]; then
@@ -72,45 +78,35 @@ else
 fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
-# Download model and dataset
-mkdir -p /root/models /root/datasets
+# Download model
+mkdir -p /root/models
 if [ ! -d "/root/models/${MODEL_NAME}" ]; then
    hf download Qwen/${MODEL_NAME} --local-dir /root/models/${MODEL_NAME}
-fi
-if [ ! -d "/root/datasets/${DATASET_LOCAL_NAME}" ]; then
-   hf download --repo-type dataset ${DATASET_NAME} --local-dir /root/datasets/${DATASET_LOCAL_NAME}
 fi
 
 # Common args
 CKPT_ARGS=(
    --hf-checkpoint /root/models/${MODEL_NAME}
-   # qwen3 vl model has rotary base 5000000, set it when applicable
    --rotary-base 5000000
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/datasets/${DATASET_LOCAL_NAME}/train.parquet
-   --input-key problem
-   --label-key answer
+   --prompt-data ${TASK_DATA}
+   --input-key prompt
+   --label-key label
    --apply-chat-template
+   --custom-generate-function-path examples.android_world.rollout.generate
+   --custom-config-path examples/android_world/config.yaml
    --rollout-shuffle
-   --rm-type math
    --num-rollout 3000
-   --rollout-batch-size 64
+   --rollout-batch-size 16
    --n-samples-per-prompt 8
    --rollout-max-response-len 4096
-   --rollout-temperature 0.8
-   --global-batch-size 512
-)
-
-# required for vlm datasets
-MULTIMODAL_KEYS='{"image": "images"}'
-
-EVAL_ARGS=(
-   --eval-interval 20
-   --eval-prompt-data ${DATASET_LOCAL_NAME} /root/datasets/${DATASET_LOCAL_NAME}/test.parquet
-   --n-samples-per-eval-prompt 1
-   --eval-max-response-len 4096
+   --rollout-temperature 0.7
+   --num-steps-per-rollout 1
+   # 是否在训练时 balance data，可能对速度有好处
+   --balance-data
+   # --global-batch-size 128
 )
 
 GRPO_ARGS=(
@@ -134,7 +130,7 @@ OPTIMIZER_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.6
+   --sglang-mem-fraction-static 0.7
    --sglang-cuda-graph-bs 1 2 4 8 16 24 32 40 48 56 64 72 80 88 96 104 112 120 128 136 144 152 160 168 176 184 192 200 208 216 224 232 240 248 256
 )
 
@@ -142,7 +138,7 @@ SGLANG_ARGS=(
 if [ -n "$WANDB_API_KEY" ]; then
    LOGGER_ARGS=(
       --use-wandb
-      --wandb-project slime-geo3k-vlm
+      --wandb-project slime-android-world
       --wandb-group ${MODEL_NAME_LOWER}-${TRAIN_BACKEND}
       --wandb-key ${WANDB_API_KEY}
       --disable-wandb-random-suffix
@@ -150,13 +146,14 @@ if [ -n "$WANDB_API_KEY" ]; then
 else
    LOGGER_ARGS=(
       --use-tensorboard
-      --tb-project-name slime-geo3k-vlm
+      --tb-project-name slime-android-world
       --tb-experiment-name ${MODEL_NAME_LOWER}-${TRAIN_BACKEND}
    )
 fi
 
 MISC_ARGS=(
-   --colocate
+   # --colocate
+   --sglang-server-concurrency 160
 )
 
 # Backend-specific args
@@ -170,21 +167,21 @@ if [ "$TRAIN_BACKEND" = "fsdp" ]; then
    )
    MODEL_ARGS=()
 else
-   # megatron backend (default)
+   # megatron backend
    BACKEND_ARGS=(
       --train-backend megatron
       --load /root/models/${MODEL_NAME}
       --tensor-model-parallel-size 4
       --sequence-parallel
       --pipeline-model-parallel-size 1
-      --context-parallel-size 1
+      --context-parallel-size 1  # CP>1 incompatible with VLM in Megatron bridge
       --expert-model-parallel-size 1
       --expert-tensor-parallel-size 1
       --recompute-granularity full
       --recompute-method uniform
       --recompute-num-layers 1
       --use-dynamic-batch-size
-      --max-tokens-per-gpu 4096
+      --max-tokens-per-gpu 2048
       --attention-dropout 0.0
       --hidden-dropout 0.0
       --accumulate-allreduce-grads-in-fp32
@@ -192,13 +189,11 @@ else
       --attention-backend flash
       --megatron-to-hf-mode bridge
    )
-   
+
    # get MODEL_ARGS from scripts/models for megatron backend
    SLIME_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)"
    MODEL_ARGS_FILE=$(echo "$MODEL_NAME" | sed 's/-Instruct//g; s/-Thinking//g; s/Qwen3-VL-/qwen3-/g; s/-2B/-1.7B/g')
-   # VL models require rotary-base 5000000
    MODEL_ARGS_ROTARY_BASE=5000000 source "${SLIME_DIR}/scripts/models/${MODEL_ARGS_FILE}.sh"
-   
 fi
 
 # Start Ray if not using external Ray
@@ -209,15 +204,6 @@ if [ "$USE_EXTERNAL_RAY" = "0" ]; then
    ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8080
    sleep 5
 fi
-
-# Build runtime env
-# RUNTIME_ENV_JSON="{
-#   \"env_vars\": {
-#     \"PYTHONPATH\": \"/root/Megatron-LM/\",
-#     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-#     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
-#   }
-# }"
 
 ray job submit --address="http://127.0.0.1:8080" \
    --runtime-env-json='{
@@ -245,14 +231,13 @@ ray job submit --address="http://127.0.0.1:8080" \
          "NCCL_PROFILE_PRIMS_ENABLE": "1"
       }
    }' \
-   -- python train.py \
-   --actor-num-nodes 1 \
-   --actor-num-gpus-per-node ${NUM_GPUS} \
-   --multimodal-keys "${MULTIMODAL_KEYS}" \
+   --no-wait -- python train.py \
+   --actor-num-nodes ${NUM_NODES} \
+   --actor-num-gpus-per-node 4 \
+   --rollout-num-gpus 4 \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
-   ${EVAL_ARGS[@]} \
    ${GRPO_ARGS[@]} \
    ${OPTIMIZER_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
