@@ -2,7 +2,7 @@
 # Loaded via --custom-config-path examples/android_world/config.yaml
 
 # Multi-turn interaction
-max_turns: 10
+max_turns: 30
 max_context_len: 16384
 
 # Environment pool
@@ -24,6 +24,6 @@ adb_path: "/root/android/platform-tools/adb"
 temp_path: "/tmp/android_world_images"
 save_images: false
 task_family: "android_world"
-image_size:
-  - 540
-  - 1200
+# image_size:
+#   - 540
+#   - 1200
