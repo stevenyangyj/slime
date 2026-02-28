@@ -12,8 +12,8 @@ import json
 import random
 
 TASK_LIST_PATH = "examples/android_world/data/task_list.txt"
-OUTPUT_PATH = "examples/android_world/data/tasks.jsonl"
-PARAMS_PER_TASK = 20
+OUTPUT_PATH = "examples/android_world/data/tasks_eval.jsonl"
+PARAMS_PER_TASK = 1
 SEED = 42
 
 

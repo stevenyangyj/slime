@@ -50,6 +50,7 @@ def _format_observation_with_history(
     action_history: list[str],
     max_steps: int,
     image_size: tuple[int, int] | None = None,
+    history_window_size: int | None = None,
 ) -> dict:
     """Format observation as a standalone user message with full action history.
 
@@ -61,6 +62,8 @@ def _format_observation_with_history(
         action_history: List of action summaries from prior steps.
         max_steps: Maximum allowed steps for the task.
         image_size: Optional (width, height) to resize the screenshot.
+        history_window_size: If set, only include the last N actions in the
+            history. None means include all actions.
 
     Returns:
         A chat message dict: {"role": "user", "content": [...]}
@@ -78,9 +81,16 @@ def _format_observation_with_history(
 
     task = obs.get("task", "") if obs else ""
     step_count = len(action_history)
+    windowed_history = (
+        action_history[-history_window_size:] if history_window_size is not None else action_history
+    )
+    # Offset step numbers so they reflect the original step index in the trajectory
+    history_offset = step_count - len(windowed_history)
     action_history_str = (
-        "\n".join(f"Step {i + 1}: {action}" for i, action in enumerate(action_history))
-        if action_history
+        "\n".join(
+            f"Step {history_offset + i + 1}: {action}" for i, action in enumerate(windowed_history)
+        )
+        if windowed_history
         else "None"
     )
     text = ANDROID_WORLD_TEMPLATE.format(
@@ -212,7 +222,9 @@ def _extract_action_summary(response_text: str) -> str:
     return response_text[:200].strip()
 
 
-async def generate(args: Any, sample: Sample, sampling_params: dict) -> list[Sample]:
+async def generate(
+    args: Any, sample: Sample, sampling_params: dict, evaluation: bool = False
+) -> list[Sample] | Sample:
     """Non-incremental multi-turn rollout for Android World.
 
     Each turn is an independent training sample: (full_history_prompt + screenshot_t
@@ -224,10 +236,13 @@ async def generate(args: Any, sample: Sample, sampling_params: dict) -> list[Sam
         args: Parsed slime arguments.
         sample: Input sample (carries task metadata; prompt is overridden per step).
         sampling_params: SGLang sampling parameters.
+        evaluation: When True (set by slime during eval), return a single Sample
+            instead of a list so that eval_rollout_single_dataset can log
+            sample.prompt and compute_pass_rate gets one reward per prompt.
 
     Returns:
-        list[Sample] — one Sample per completed trajectory step, all sharing the
-        same trajectory reward.
+        list[Sample] during training (one per trajectory step), or a single Sample
+        during evaluation.
     """
     assert not getattr(args, "partial_rollout", False), (
         "Partial rollout is not supported for Android World history-based rollouts."
@@ -240,6 +255,7 @@ async def generate(args: Any, sample: Sample, sampling_params: dict) -> list[Sam
     params_idx = (sample.metadata or {}).get("params_idx", 0)
     max_turns = getattr(args, "max_turns", 15)
     image_size = getattr(args, "image_size", None)
+    history_window_size = getattr(args, "history_window_size", None)
     apply_chat_template = getattr(args, "apply_chat_template", True)
     apply_chat_template_kwargs = getattr(args, "apply_chat_template_kwargs", None)
 
@@ -268,7 +284,9 @@ async def generate(args: Any, sample: Sample, sampling_params: dict) -> list[Sam
 
         for turn_idx in range(max_turns):
             # Build a standalone prompt for this step with full history
-            step_user_msg = _format_observation_with_history(obs, action_history, max_steps, image_size)
+            step_user_msg = _format_observation_with_history(
+                obs, action_history, max_steps, image_size, history_window_size
+            )
             prompt_text, prompt_ids, image_data, mm_inputs, mm_train = _build_step_prompt(
                 tokenizer=state.tokenizer,
                 processor=state.processor,
@@ -341,6 +359,15 @@ async def generate(args: Any, sample: Sample, sampling_params: dict) -> list[Sam
         if env.cumulative_reward == 0.0 and not env.task_won:
             env.cumulative_reward = await env.compute_final_reward()
         reward = env.get_reward()
+
+        # For evaluation, return a single Sample with trajectory-level reward.
+        # eval_rollout_single_dataset expects one Sample per prompt (not a list)
+        # so it can log sample.prompt and compute_pass_rate gets the right count.
+        if evaluation:
+            final = trajectory_samples[-1] if trajectory_samples else sample
+            final.reward = reward
+            final.status = Sample.Status.COMPLETED
+            return final
 
         # Assign the trajectory-level reward to every step sample
         for s in trajectory_samples:

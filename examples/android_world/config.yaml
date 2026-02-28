@@ -4,6 +4,7 @@
 # Multi-turn interaction
 max_turns: 30
 max_context_len: 16384
+history_window_size: 10  # Limit action history to last N steps (null = unlimited)
 
 # Environment pool
 num_workers: 128

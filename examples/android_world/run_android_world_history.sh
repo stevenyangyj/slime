@@ -61,7 +61,7 @@ fi
 # Cleanup
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -x "${SCRIPT_DIR}/cleanup.sh" ]; then
-   bash "${SCRIPT_DIR}/cleanup.sh" 2>/dev/null || true
+   bash "${SCRIPT_DIR}/cleanup.sh" --all 2>/dev/null || true
 fi
 pkill -9 sglang
 sleep 3
@@ -118,6 +118,7 @@ ROLLOUT_ARGS=(
    --rollout-max-response-len 4096
    --rollout-temperature 0.7
    --num-steps-per-rollout 1
+   # --global-batch-size 16
    --balance-data
 )
 
@@ -142,7 +143,7 @@ OPTIMIZER_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.82
+   --sglang-mem-fraction-static 0.85
    --sglang-cuda-graph-bs 1 2 4 8 16 24 32
 )
 
@@ -167,6 +168,13 @@ MISC_ARGS=(
    --sglang-server-concurrency 256
 )
 
+EVAL_ARGS=(
+   --eval-interval 50
+   --eval-prompt-data android_world examples/android_world/data/tasks_eval.jsonl
+   --n-samples-per-eval-prompt 1
+   # --skip-eval-before-train
+)
+
 # Backend-specific args
 if [ "$TRAIN_BACKEND" = "fsdp" ]; then
    BACKEND_ARGS=(
@@ -189,9 +197,9 @@ else
       --expert-tensor-parallel-size 1
       --recompute-granularity full
       --recompute-method uniform
-      --recompute-num-layers 1
+      # --recompute-num-layers 1
       --use-dynamic-batch-size
-      --max-tokens-per-gpu 8192
+      --max-tokens-per-gpu 4608
       --log-probs-max-tokens-per-gpu 16384
       --attention-dropout 0.0
       --hidden-dropout 0.0
@@ -255,4 +263,5 @@ ray job submit --address="http://127.0.0.1:8080" \
    ${SGLANG_ARGS[@]} \
    ${LOGGER_ARGS[@]} \
    ${BACKEND_ARGS[@]} \
-   ${MISC_ARGS[@]}
+   ${MISC_ARGS[@]} \
+   ${EVAL_ARGS[@]}
