@@ -4,10 +4,10 @@ Train vision-language model (VLM) agents to complete tasks on Android devices us
 
 Two rollout modes are provided:
 
-| Mode | Module | `--custom-generate-function-path` | Launch script |
-|------|--------|-----------------------------------|---------------|
-| **Incremental** (default) | `rollout.py` | `examples.android_world.rollout.generate` | `run_android_world_opt.sh` |
-| **History-based** | `rollout_history.py` | `examples.android_world.rollout_history.generate` | `run_android_world_history.sh` |
+| Mode | Module | `--custom-generate-function-path` | `--custom-reward-post-process-path` | Launch script |
+|------|--------|-----------------------------------|-------------------------------------|---------------|
+| **Incremental** (default) | `rollout.py` | `examples.android_world.rollout.generate` | _(none, default works)_ | `run_android_world_opt.sh` |
+| **History-based** | `rollout_history.py` | `examples.android_world.rollout_history.generate` | `examples.android_world.rollout_history.post_process_rewards_history` | `run_android_world_history.sh` |
 
 See [Rollout Modes](#rollout-modes) for a detailed comparison.
 
@@ -40,7 +40,7 @@ Each rollout sample runs an independent async multi-turn loop:
 3. Build the initial VLM prompt (system prompt + screenshot + task text)
 4. Loop: SGLang generates an action → environment executes it → screenshot returned → repeat
 5. Episode ends when the agent calls `terminate` or hits `max_turns`
-6. Reward = task success (0 or 1) + step shaping (thinking bonus, step decay, premature penalty)
+6. Reward = task success (0 or 1) + step shaping, only evaluated on explicit termination; timeout = 0.0
 7. Release the worker back to the pool
 
 ## Prerequisites
@@ -215,33 +215,48 @@ examples/android_world/
     test_imports.py          # Import path verification
     test_env_pool.py         # Pool acquire/release + worker ops
     test_rollout.py          # End-to-end rollout with SGLang
+    test_reward_post_process.py # Unit tests for GRPO reward normalization
 ```
 
 ### Module Roles
 
 - **`rollout.py`** is the default entry point (incremental mode), specified via `--custom-generate-function-path examples.android_world.rollout.generate`. It orchestrates the multi-turn loop: pool acquisition, prompt construction, SGLang inference, env stepping, token/loss_mask management, and reward computation. Produces 1 training sample per trajectory.
 
-- **`rollout_history.py`** is the non-incremental entry point (history-based mode), specified via `--custom-generate-function-path examples.android_world.rollout_history.generate`. Each step builds a standalone prompt with full action history (using `ANDROID_WORLD_TEMPLATE`), producing T independent training samples per trajectory. See [Rollout Modes](#rollout-modes) for details.
+- **`rollout_history.py`** is the non-incremental entry point (history-based mode), specified via `--custom-generate-function-path examples.android_world.rollout_history.generate`. Each step builds a standalone prompt with full action history (using `ANDROID_WORLD_TEMPLATE`), producing T independent training samples per trajectory. Also provides `post_process_rewards_history` (wired via `--custom-reward-post-process-path`) for correct GRPO normalization with variable-length trajectories. See [Rollout Modes](#rollout-modes) for details.
 
 - **`env_pool.py`** manages a singleton pool of persistent `AndroidWorldWorker` Ray actors. Workers are created once (emulator boot is expensive) and reused across all training iterations. The `asyncio.Queue`-based acquire/release is safe for concurrent async generate calls.
 
-- **`env_android_world.py`** implements slime's `BaseInteractionEnv` interface, wrapping a single remote worker with async `reset()`, `step()`, `compute_final_reward()`, plus sync `format_observation()` and `close()`. The async methods use `asyncio.to_thread(ray.get, ...)` so concurrent samples can overlap on the event loop. On close, the worker is released back to the pool (not destroyed). See [Async Environment Calls](#async-environment-calls-rayget-fix) for background.
+- **`env_android_world.py`** implements slime's `BaseInteractionEnv` interface, wrapping a single remote worker with async `reset()`, `step()`, plus sync `format_observation()`, `get_reward()`, and `close()`. The async methods use `asyncio.to_thread(ray.get, ...)` so concurrent samples can overlap on the event loop. On close, the worker is released back to the pool (not destroyed). See [Async Environment Calls](#async-environment-calls-rayget-fix) for background.
 
 - **`env_worker.py`** contains the actual Android emulator interaction: AVD cloning, emulator lifecycle, action parsing (`<tool_call>` XML to `JSONAction`), coordinate rescaling, and reward shaping.
 
 ## Reward Design
 
-Rewards are computed inside `generate()` (no external `--rm-type` needed):
+Rewards are computed inside `env_worker.py`'s `step()` when the agent explicitly terminates (no external `--rm-type` needed). If the agent hits `max_turns` without terminating, the reward is `0.0` — no task evaluation is performed.
 
 | Condition | Reward |
 |-----------|--------|
-| Task success (`is_successful = 1`) | `1.0 * step_scale + thinking_bonus` |
+| Task success (`is_successful = 1`) + agent terminated | `1.0 * step_scale + thinking_bonus` |
 | Task failure + agent terminated | `0.0 - premature_penalty` |
-| Task failure + max turns reached | `0.0` |
+| Max turns reached (no explicit termination) | `0.0` |
 
 - **Step scale**: `exp(-0.1 * steps)`, clamped to [0.1, 1.5] — rewards fewer steps
 - **Thinking bonus**: Sigmoid-scaled bonus based on average thinking tokens per step
 - **Premature penalty**: Up to 0.5, proportional to how early the agent terminated
+
+### TensorBoard Reward Metrics
+
+Three reward-related metrics appear under `rollout/` in TensorBoard. They represent different processing stages of the same underlying reward:
+
+| Metric | Source | Computation | Meaning |
+|--------|--------|-------------|---------|
+| `rollout/raw_reward` | `rollout_data["raw_reward"]` | Simple average across samples | Original shaped reward from `env.get_reward()`, before any normalization |
+| `rollout/rewards` | `rollout_data["rewards"]` | Simple average across samples | Reward after GRPO group normalization (mean-subtracted, optionally std-divided within each group of `n_samples_per_prompt`) |
+| `rollout/returns` | `rollout_data["returns"]` | Loss-mask-weighted average, gathered across DP ranks | GRPO-normalized reward broadcast to every response token, then weighted by `loss_mask` (so observation tokens with mask=0 are excluded and longer responses contribute more) |
+
+For GRPO, `returns = advantages = normalized_reward` repeated for each response token (`slime/backends/megatron_utils/loss.py`). The `rollout/returns` logging weights each sample by its loss-mask sum, while `rollout/rewards` weights all samples equally — this is why the two differ even though they derive from the same normalized values.
+
+**History-based mode note**: In history-based rollout, the custom `post_process_rewards_history` function controls how `rollout/rewards` and `rollout/returns` are computed. `rollout/raw_reward` is unaffected (always the original `env.get_reward()` value, averaged across all step-samples — longer trajectories contribute more step-samples, so this metric is biased toward them, but it is logging-only and does not affect training). `rollout/rewards` reflects per-prompt, per-trajectory normalization: each trajectory gets equal weight regardless of step count, and different prompts are never mixed. `rollout/returns` inherits from `rollout/rewards` — the normalized scalar is broadcast to every response token via `get_grpo_returns`, so the policy gradient correctly up-weights trajectories that outperform their per-prompt peers.
 
 ## Token and Loss Mask Layout
 
@@ -274,6 +289,7 @@ Each turn is an **independent** training sample: the prompt is rebuilt from scra
 
 ```
 --custom-generate-function-path examples.android_world.rollout_history.generate
+--custom-reward-post-process-path examples.android_world.rollout_history.post_process_rewards_history
 ```
 
 **Launch script:**
@@ -328,25 +344,36 @@ There is no cross-turn accumulated budget. If a step's prompt exceeds `max_conte
 | Context growth | Accumulated (KV cache reuse) | Rebuilt from scratch each step |
 | SGLang calls per T-step trajectory | T (incremental, cached) | T (independent, no cache reuse) |
 | Token budget | Global across all turns | Independent per step |
+| GRPO reward normalization | Default `_post_process_rewards` (reshape works because 1 sample per trajectory) | Custom `post_process_rewards_history` (groups by prompt, normalizes per-trajectory) |
 | Matching RL method | Custom multi-turn RL | R1-V / InternVL-RL style VLM RL |
 
 #### GRPO with history-based rollout
 
-With `--n-samples-per-prompt N`, each task prompt runs N independent trajectories. Each trajectory produces T step-samples. After flattening:
+With `--n-samples-per-prompt N`, each task prompt runs N independent trajectories. Each trajectory produces T step-samples (T varies per trajectory). After flattening:
 
 ```
-[traj1_step1, ..., traj1_stepT, traj2_step1, ..., traj2_stepT, ..., trajN_stepT]
+[traj1_step1, ..., traj1_stepT1, traj2_step1, ..., traj2_stepT2, ..., trajN_stepTN]
 ```
 
-slime's `_post_process_rewards` reshapes rewards as `(-1, N)`. Since all T steps within a trajectory share the same reward, the reshape yields rows where position `i` contains step `i` from each trajectory. GRPO then normalizes across N trajectories per row.
+Because trajectory lengths vary, the total sample count != `N * rollout_batch_size`. The default `_post_process_rewards` reshape falls through to a `(1, total)` fallback, which normalizes all rewards across all prompts as a single group — breaking GRPO's per-prompt normalization semantics and biasing gradients toward longer trajectories.
 
-This works cleanly when all N trajectories produce equal T. When trajectory lengths vary, the reshape mixes steps across trajectories. This is a known limitation and is acceptable in practice since the trajectory-level reward is constant across all steps within each trajectory.
+The `--custom-reward-post-process-path examples.android_world.rollout_history.post_process_rewards_history` flag fixes this by:
+1. Grouping samples by `group_index` (one group per prompt)
+2. Within each group, identifying trajectories by `index` (the sample copy ID)
+3. Computing one reward per trajectory (all steps share the same reward)
+4. Normalizing across N trajectory rewards per prompt (mean-subtraction, optional std normalization)
+5. Broadcasting the normalized reward back to every step-sample in each trajectory
+
+This ensures each trajectory contributes equally to the gradient regardless of step count, and different prompts are never mixed during normalization.
 
 ## Verification Tests
 
 Run from the slime repo root:
 
 ```bash
+# Step 0: Reward normalization unit tests (no emulators/GPU needed)
+pytest examples/android_world/tests/test_reward_post_process.py -v
+
 # Step 1: Import verification (no emulators/GPU needed)
 python examples/android_world/tests/test_imports.py
 
@@ -391,7 +418,7 @@ Running with `num_workers=64` vs `num_workers=128` in `config.yaml` produced nea
 
 The `generate()` function in `rollout.py` is an `async` coroutine. slime launches many `generate()` calls concurrently (one per sample) on a shared asyncio event loop. The expectation is that while one sample waits on I/O (SGLang inference, emulator interaction), other samples can make progress.
 
-However, `AndroidWorldEnv.reset()`, `step()`, and `compute_final_reward()` were using synchronous `ray.get()` to wait for remote worker results:
+However, `AndroidWorldEnv.reset()` and `step()` were using synchronous `ray.get()` to wait for remote worker results:
 
 ```python
 # OLD — blocks the entire event loop thread
@@ -413,7 +440,7 @@ With 128 concurrent samples each doing 5-30 turns of `env.step()` (3-7 seconds p
 
 ### Fix: `asyncio.to_thread(ray.get, ...)`
 
-The three blocking methods in `env_android_world.py` were converted to async using `asyncio.to_thread()`:
+The two blocking methods in `env_android_world.py` were converted to async using `asyncio.to_thread()`:
 
 ```python
 # NEW — offloads blocking ray.get() to a thread pool, freeing the event loop
@@ -438,8 +465,8 @@ Thread pool:       [ray.get(s1)     ──────────────�
 
 | File | Change |
 |------|--------|
-| `env_android_world.py` | `reset()`, `step()`, `compute_final_reward()` changed from `def` to `async def`, `ray.get(...)` wrapped with `await asyncio.to_thread(ray.get, ...)` |
-| `rollout.py` | All call sites updated: `env.reset()` / `env.step()` / `env.compute_final_reward()` now use `await` |
+| `env_android_world.py` | `reset()`, `step()` changed from `def` to `async def`, `ray.get(...)` wrapped with `await asyncio.to_thread(ray.get, ...)` |
+| `rollout.py` | All call sites updated: `env.reset()` / `env.step()` now use `await` |
 
 ### Why This Matters
 
@@ -451,7 +478,7 @@ After this fix, all 128 samples can have their `ray.get()` calls in-flight simul
 
 - `asyncio.to_thread()` uses Python's default `ThreadPoolExecutor`. The default pool size is `min(32, os.cpu_count() + 4)`. If you run >32 concurrent samples, the thread pool itself becomes a bottleneck. In that case, increase the pool size at startup: `import asyncio; loop = asyncio.get_event_loop(); loop.set_default_executor(ThreadPoolExecutor(max_workers=256))`.
 - The `BaseInteractionEnv` base class in `geo3k_vlm_multi_turn/base_env.py` still defines sync `reset()`/`step()`. This is fine — `Geo3kEnv` performs only local CPU work (no blocking I/O), so sync calls do not block the event loop. The async override is specific to `AndroidWorldEnv` where remote Ray calls introduce multi-second blocking waits.
-- `format_observation()` and `close()` remain synchronous. `format_observation()` does local image resizing and string formatting (microseconds, no I/O). `close()` calls `pool.release()` which is a simple queue put (also non-blocking).
+- `format_observation()`, `get_reward()`, and `close()` remain synchronous. `format_observation()` does local image resizing and string formatting (microseconds, no I/O). `get_reward()` returns a stored value. `close()` calls `pool.release()` which is a simple queue put (also non-blocking).
 
 ## Troubleshooting
 

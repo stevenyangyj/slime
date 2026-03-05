@@ -213,11 +213,6 @@ async def generate(args: Any, sample: Sample, sampling_params: dict) -> Sample:
 
             if done or step_obs is None:
                 sample.status = Sample.Status.COMPLETED
-                # Reward already accumulated in env during step()
-                # If the agent terminated, the terminal reward is already counted
-                if env.cumulative_reward == 0.0 and not env.task_won:
-                    # Agent didn't explicitly terminate — evaluate task success
-                    env.cumulative_reward = await env.compute_final_reward()
                 break
 
             # Encode observation (screenshot + step counter, loss_mask=0)
@@ -258,9 +253,6 @@ async def generate(args: Any, sample: Sample, sampling_params: dict) -> Sample:
                 break
 
         # -- 7. Set reward --
-        if env.cumulative_reward == 0.0 and not env.task_won:
-            # Episode ended without explicit termination — evaluate task
-            env.cumulative_reward = await env.compute_final_reward()
         sample.reward = env.get_reward()
 
         # -- 8. Finalize --

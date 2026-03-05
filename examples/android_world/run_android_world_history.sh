@@ -109,6 +109,8 @@ ROLLOUT_ARGS=(
    --apply-chat-template
    # Non-incremental history-based rollout: each step is an independent sample
    --custom-generate-function-path examples.android_world.rollout_history.generate
+   # Fix GRPO normalization for variable-length trajectories (groups by prompt, normalizes per-trajectory)
+   --custom-reward-post-process-path examples.android_world.rollout_history.post_process_rewards_history
    --custom-config-path examples/android_world/config.yaml
    --rollout-seed 18
    --rollout-shuffle
@@ -139,11 +141,15 @@ OPTIMIZER_ARGS=(
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
+
+   --optimizer-cpu-offload
+   --overlap-cpu-optimizer-d2h-h2d
+   --use-precision-aware-optimizer
 )
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.85
+   --sglang-mem-fraction-static 0.82
    --sglang-cuda-graph-bs 1 2 4 8 16 24 32
 )
 
@@ -197,9 +203,9 @@ else
       --expert-tensor-parallel-size 1
       --recompute-granularity full
       --recompute-method uniform
-      # --recompute-num-layers 1
+      --recompute-num-layers 1
       --use-dynamic-batch-size
-      --max-tokens-per-gpu 4608
+      --max-tokens-per-gpu 8192
       --log-probs-max-tokens-per-gpu 16384
       --attention-dropout 0.0
       --hidden-dropout 0.0

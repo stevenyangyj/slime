@@ -6,7 +6,7 @@ plus helper functions for AVD management, action parsing, and port allocation.
 Ported from verl-agent (Apache-2.0 licensed) with adaptations for slime's architecture:
 - Removed AndroidWorldEnvs batched wrapper (replaced by env_pool.py)
 - Removed AndroidWorldEnvironmentManager (replaced by env_android_world.py)
-- Added compute_final_reward() for reward evaluation at episode end
+
 """
 
 from __future__ import annotations
@@ -626,7 +626,8 @@ class AndroidWorldWorker:
                     logger.error("[Worker %d] Task evaluation failed: %s", self.worker_id, e)
                     base_reward = 0.0
 
-                step_reward = self._compute_step_reward(action, base_reward)
+                # step_reward = self._compute_step_reward(action, base_reward)
+                step_reward = base_reward  # For now, use base reward directly without shaping
                 self.terminated = True
                 info = {"won": base_reward >= 1.0, "base_reward": base_reward, "step_count": self.steps}
                 return before_action_obs, step_reward, True, info
@@ -662,20 +663,6 @@ class AndroidWorldWorker:
             logger.error("[Worker %d] Error during step %d: %s", self.worker_id, self.steps, e)
             self.terminated = True
             return None, 0.0, True, {"won": False}
-
-    def compute_final_reward(self) -> float:
-        """Evaluate task success and return final shaped reward.
-
-        Called at episode end when the agent did not explicitly terminate
-        (e.g., max_turns reached or token budget exhausted).
-        """
-        try:
-            base_reward = self.task_instance.is_successful(self.env)
-        except Exception:
-            base_reward = 0.0
-        # Use a dummy terminal action for reward shaping
-        dummy_action = json_action.JSONAction(action_type="status", goal_status="complete")
-        return self._compute_step_reward(dummy_action, base_reward)
 
     def _get_action_description(self, response: str) -> str:
         """Extract action description from response for history tracking."""

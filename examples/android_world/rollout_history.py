@@ -11,11 +11,15 @@ built from scratch, compatible with standard VLM RL methods (R1-V, InternVL-RL s
 
 GRPO usage:
     --custom-generate-function-path examples.android_world.rollout_history.generate
+    --custom-reward-post-process-path examples.android_world.rollout_history.post_process_rewards_history
     --n-samples-per-prompt N  # e.g. 8
 
-With n_samples_per_prompt=N, slime's _post_process_rewards reshapes rewards as
-(-1, N), yielding one row per trajectory step shared across N trajectories, so GRPO
-normalizes the trajectory-level reward across N trajectories as intended.
+The custom post_process_rewards_history function is required because variable-length
+trajectories break the default _post_process_rewards reshape logic. Without it, the
+default code path normalizes all samples as a single group (cross-prompt), biasing
+gradients toward longer trajectories. The custom function groups samples by group_index
+(prompt), computes per-trajectory rewards, and normalizes across N trajectories per
+prompt — matching correct GRPO semantics.
 """
 
 from __future__ import annotations
@@ -222,6 +226,71 @@ def _extract_action_summary(response_text: str) -> str:
     return response_text[:200].strip()
 
 
+def post_process_rewards_history(args, samples: list[Sample]) -> tuple[list[float], list[float]]:
+    """GRPO reward normalization that correctly handles variable-length trajectories.
+
+    The default _post_process_rewards in slime/ray/rollout.py reshapes rewards as
+    (-1, n_samples_per_prompt) and falls back to (1, total) when total != N*B. With
+    history-based rollout, each trajectory produces a variable number of step-samples
+    (all sharing the same reward), so the total is always != N*B. The fallback
+    normalizes all samples as one group, mixing prompts and biasing toward longer
+    trajectories.
+
+    This function fixes three problems:
+    1. Cross-prompt normalization: different prompts are never mixed.
+    2. Length bias: each trajectory contributes equally regardless of step count.
+    3. Cross-trajectory mixing: normalization is strictly per-prompt across N trajectories.
+
+    Groups samples by group_index (prompt), identifies trajectories by index
+    (sample copy within group), computes per-trajectory reward, normalizes
+    across N trajectories, and broadcasts back to all step-samples.
+    """
+    import torch
+
+    raw_rewards = [s.get_reward_value(args) for s in samples]
+
+    if not (
+        args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
+        and args.rewards_normalization
+    ):
+        return raw_rewards, raw_rewards
+
+    normalized = [0.0] * len(samples)
+
+    # group_index identifies the prompt, index identifies the trajectory copy
+    groups: dict[int, list[tuple[int, Sample]]] = {}
+    for pos, s in enumerate(samples):
+        groups.setdefault(s.group_index, []).append((pos, s))
+
+    for _group_index, members in groups.items():
+        # Within a group, sub-group by trajectory (s.index)
+        trajs: dict[int, list[int]] = {}
+        for pos, s in members:
+            trajs.setdefault(s.index, []).append(pos)
+
+        # Each trajectory has a single reward (all steps share it)
+        traj_rewards = []
+        traj_positions = []
+        for _idx, positions in trajs.items():
+            reward = raw_rewards[positions[0]]  # all steps have the same reward
+            traj_rewards.append(reward)
+            traj_positions.append(positions)
+
+        # Normalize across N trajectories for this prompt
+        tr = torch.tensor(traj_rewards, dtype=torch.float)
+        tr = tr - tr.mean()
+        if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
+            std = tr.std()
+            tr = tr / (std + 1e-6)
+
+        # Broadcast normalized reward back to all step-samples in each trajectory
+        for norm_reward, positions in zip(tr.tolist(), traj_positions):
+            for pos in positions:
+                normalized[pos] = norm_reward
+
+    return raw_rewards, normalized
+
+
 async def generate(
     args: Any, sample: Sample, sampling_params: dict, evaluation: bool = False
 ) -> list[Sample] | Sample:
@@ -345,9 +414,6 @@ async def generate(
             action_history.append(_extract_action_summary(response_text))
 
             if done or step_obs is None:
-                # Environment terminated (explicit terminate action or episode end)
-                if env.cumulative_reward == 0.0 and not env.task_won:
-                    env.cumulative_reward = await env.compute_final_reward()
                 break
 
             obs = step_obs
@@ -355,9 +421,6 @@ async def generate(
             if turn_idx + 1 >= max_turns:
                 break
 
-        # Evaluate task success if the episode ended without explicit termination
-        if env.cumulative_reward == 0.0 and not env.task_won:
-            env.cumulative_reward = await env.compute_final_reward()
         reward = env.get_reward()
 
         # For evaluation, return a single Sample with trajectory-level reward.

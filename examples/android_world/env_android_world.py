@@ -45,7 +45,7 @@ class AndroidWorldEnv(BaseInteractionEnv):
         self.max_steps = max_turns  # updated after reset
         self.image_size = tuple(image_size) if image_size else None
         self.turn = 0
-        self.cumulative_reward = 0.0
+        self.final_reward = 0.0
         self.task_won = False
         self._closed = False
 
@@ -67,16 +67,16 @@ class AndroidWorldEnv(BaseInteractionEnv):
         obs, step_reward, done, info = await asyncio.to_thread(
             ray.get, self.worker_ref.step.remote(response_text)
         )
-        self.cumulative_reward += step_reward
         if done:
+            self.final_reward = step_reward
             self.task_won = info.get("won", False)
         if obs is None:
             done = True
         return obs, done, info
 
-    async def compute_final_reward(self) -> float:
-        """Evaluate task success on the remote worker (for episodes not explicitly terminated)."""
-        return await asyncio.to_thread(ray.get, self.worker_ref.compute_final_reward.remote())
+    def get_reward(self) -> float:
+        """Return the reward from the final step of the episode."""
+        return self.final_reward
 
     def format_observation(self, observation: dict[str, Any], is_initial: bool = True) -> dict:
         """Format observation into a VLM-compatible chat message dict.
@@ -122,10 +122,6 @@ class AndroidWorldEnv(BaseInteractionEnv):
 
         content.append({"type": "text", "text": text})
         return {"role": "user", "content": content}
-
-    def get_reward(self) -> float:
-        """Return the total shaped reward accumulated during the episode."""
-        return self.cumulative_reward
 
     def close(self) -> None:
         """Release the worker back to the pool (does NOT destroy the emulator)."""

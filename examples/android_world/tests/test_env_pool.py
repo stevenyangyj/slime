@@ -173,7 +173,7 @@ async def test_env_wrapper(pool):
     print("\n[14] Step via env wrapper...")
     action = '<thinking>Waiting.</thinking><tool_call>{"name": "mobile_use", "arguments": {"action": "wait", "time": 1.0}}</tool_call><conclusion>Waited.</conclusion>'
     step_obs, done, step_info = env.step(action)
-    print(f"    done={done}, cumulative_reward={env.cumulative_reward}")
+    print(f"    done={done}, final_reward={env.final_reward}")
     assert not done, "Single wait action should not end episode"
 
     print("\n[15] Close env wrapper (release back to pool)...")
