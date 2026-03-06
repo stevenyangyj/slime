@@ -70,7 +70,7 @@ def check_reward_nonzero_std_history(args, group, **kwargs):
     keep = bool(torch.tensor(traj_rewards, dtype=torch.float).std() > 0.0)
     return DynamicFilterOutput(
         keep=keep,
-        reason=None if keep else f"zero_std_{round(traj_rewards[0], 1)}",
+        reason=None if keep else f"zero_std_{round(float(traj_rewards[0]), 1)}",
     )
 
 
