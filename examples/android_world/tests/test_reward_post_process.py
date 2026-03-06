@@ -241,5 +241,114 @@ class TestPostProcessRewardsHistory:
         assert abs(normalized[3] - (-2.0)) < 1e-5
 
 
+class TestCheckRewardNonzeroStdHistory:
+    """Tests for check_reward_nonzero_std_history dynamic sampling filter."""
+
+    @staticmethod
+    def _import_filter():
+        from examples.android_world.rollout_history import check_reward_nonzero_std_history
+
+        return check_reward_nonzero_std_history
+
+    def test_keeps_group_with_varied_rewards(self):
+        """Group with different trajectory rewards should be kept."""
+        filt = self._import_filter()
+        args = _make_args()
+
+        # 3 trajectories with different rewards
+        group = [
+            [_make_sample(0, 0, reward=1.0), _make_sample(0, 0, reward=1.0)],
+            [_make_sample(0, 1, reward=0.0)],
+            [_make_sample(0, 2, reward=0.5), _make_sample(0, 2, reward=0.5)],
+        ]
+
+        result = filt(args, group)
+        assert result.keep is True
+        assert result.reason is None
+
+    def test_drops_group_with_uniform_rewards_all_succeed(self):
+        """Group where all trajectories succeed (reward=1.0) should be dropped."""
+        filt = self._import_filter()
+        args = _make_args()
+
+        group = [
+            [_make_sample(0, 0, reward=1.0), _make_sample(0, 0, reward=1.0)],
+            [_make_sample(0, 1, reward=1.0)],
+            [_make_sample(0, 2, reward=1.0), _make_sample(0, 2, reward=1.0)],
+        ]
+
+        result = filt(args, group)
+        assert result.keep is False
+        assert result.reason == "zero_std_1.0"
+
+    def test_drops_group_with_uniform_rewards_all_fail(self):
+        """Group where all trajectories fail (reward=0.0) should be dropped."""
+        filt = self._import_filter()
+        args = _make_args()
+
+        group = [
+            [_make_sample(0, 0, reward=0.0)],
+            [_make_sample(0, 1, reward=0.0), _make_sample(0, 1, reward=0.0)],
+        ]
+
+        result = filt(args, group)
+        assert result.keep is False
+        assert result.reason == "zero_std_0.0"
+
+    def test_handles_flat_samples_in_group(self):
+        """Falls back to flat Sample elements (not wrapped in list)."""
+        filt = self._import_filter()
+        args = _make_args()
+
+        # Mix of list[Sample] and bare Sample
+        group = [
+            _make_sample(0, 0, reward=1.0),
+            _make_sample(0, 1, reward=0.0),
+        ]
+
+        result = filt(args, group)
+        assert result.keep is True
+
+    def test_drops_flat_samples_with_uniform_rewards(self):
+        """Flat Sample group with uniform rewards should be dropped."""
+        filt = self._import_filter()
+        args = _make_args()
+
+        group = [
+            _make_sample(0, 0, reward=0.5),
+            _make_sample(0, 1, reward=0.5),
+            _make_sample(0, 2, reward=0.5),
+        ]
+
+        result = filt(args, group)
+        assert result.keep is False
+        assert result.reason == "zero_std_0.5"
+
+    def test_single_trajectory_is_dropped(self):
+        """A group with only one trajectory has std=0 and should be dropped."""
+        filt = self._import_filter()
+        args = _make_args()
+
+        group = [
+            [_make_sample(0, 0, reward=0.7), _make_sample(0, 0, reward=0.7)],
+        ]
+
+        result = filt(args, group)
+        assert result.keep is False
+
+    def test_nearly_equal_rewards_kept(self):
+        """Rewards that differ even slightly should be kept (std > 0)."""
+        filt = self._import_filter()
+        args = _make_args()
+
+        group = [
+            [_make_sample(0, 0, reward=1.0)],
+            [_make_sample(0, 1, reward=0.999)],
+        ]
+
+        result = filt(args, group)
+        assert result.keep is True
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

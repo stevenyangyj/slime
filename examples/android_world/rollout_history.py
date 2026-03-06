@@ -49,6 +49,31 @@ from slime.utils.types import Sample
 logger = logging.getLogger(__name__)
 
 
+def check_reward_nonzero_std_history(args, group, **kwargs):
+    """Dynamic filter for history-based rollout groups.
+
+    Each element of ``group`` is ``list[Sample]`` (one trajectory's steps).
+    All steps in a trajectory share the same reward, so we take the first.
+    Drop the group if all N trajectory rewards are identical (std == 0).
+    """
+    import torch
+
+    from slime.rollout.filter_hub.base_types import DynamicFilterOutput
+
+    traj_rewards = []
+    for traj in group:
+        if isinstance(traj, list):
+            traj_rewards.append(traj[0].get_reward_value(args))
+        else:
+            traj_rewards.append(traj.get_reward_value(args))
+
+    keep = bool(torch.tensor(traj_rewards, dtype=torch.float).std() > 0.0)
+    return DynamicFilterOutput(
+        keep=keep,
+        reason=None if keep else f"zero_std_{round(traj_rewards[0], 1)}",
+    )
+
+
 def _format_observation_with_history(
     obs: dict[str, Any],
     action_history: list[str],

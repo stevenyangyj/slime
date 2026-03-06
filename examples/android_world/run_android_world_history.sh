@@ -111,11 +111,14 @@ ROLLOUT_ARGS=(
    --custom-generate-function-path examples.android_world.rollout_history.generate
    # Fix GRPO normalization for variable-length trajectories (groups by prompt, normalizes per-trajectory)
    --custom-reward-post-process-path examples.android_world.rollout_history.post_process_rewards_history
+   # Drop prompt groups where all N trajectories have identical rewards (zero advantage → zero gradients → NaN)
+   --dynamic-sampling-filter-path examples.android_world.rollout_history.check_reward_nonzero_std_history
    --custom-config-path examples/android_world/config.yaml
    --rollout-seed 18
    --rollout-shuffle
    --num-rollout 3000
    --rollout-batch-size 16
+   --over-sampling-batch-size 32
    --n-samples-per-prompt 8
    --rollout-max-response-len 4096
    --rollout-temperature 0.7
@@ -175,10 +178,10 @@ MISC_ARGS=(
 )
 
 EVAL_ARGS=(
-   --eval-interval 50
+   --eval-interval 20
    --eval-prompt-data android_world examples/android_world/data/tasks_eval.jsonl
    --n-samples-per-eval-prompt 1
-   # --skip-eval-before-train
+   --skip-eval-before-train
 )
 
 # Backend-specific args
