@@ -4,10 +4,10 @@ Train vision-language model (VLM) agents to complete tasks on Android devices us
 
 Two rollout modes are provided:
 
-| Mode | Module | `--custom-generate-function-path` | `--custom-reward-post-process-path` | Launch script |
-|------|--------|-----------------------------------|-------------------------------------|---------------|
-| **Incremental** (default) | `rollout.py` | `examples.android_world.rollout.generate` | _(none, default works)_ | `run_android_world_opt.sh` |
-| **History-based** | `rollout_history.py` | `examples.android_world.rollout_history.generate` | `examples.android_world.rollout_history.post_process_rewards_history` | `run_android_world_history.sh` |
+| Mode | Module | `--custom-generate-function-path` | `--custom-reward-post-process-path` | `--dynamic-sampling-filter-path` | Launch script |
+|------|--------|-----------------------------------|-------------------------------------|----------------------------------|---------------|
+| **Incremental** (default) | `rollout.py` | `examples.android_world.rollout.generate` | _(none, default works)_ | _(none)_ | `run_android_world_opt.sh` |
+| **History-based** | `rollout_history.py` | `examples.android_world.rollout_history.generate` | `examples.android_world.rollout_history.post_process_rewards_history` | `examples.android_world.rollout_history.check_reward_nonzero_std_history` | `run_android_world_history.sh` |
 
 See [Rollout Modes](#rollout-modes) for a detailed comparison.
 
@@ -177,8 +177,10 @@ Key args in `run_android_world.sh` / `run_android_world.py` (edit directly or ov
 | Argument | Value | Description |
 |----------|-------|-------------|
 | `--num-rollout` | 16 | Number of rollout iterations |
-| `--rollout-batch-size` | 8 | Unique prompts processed per rollout step |
+| `--rollout-batch-size` | 8 | Unique prompts (groups) that survive filtering per rollout step |
 | `--n-samples-per-prompt` | 8 | GRPO copies per prompt |
+| `--over-sampling-batch-size` | 32 | Prompts requested per data source call (history-based mode; 2x rollout-batch-size for filter headroom) |
+| `--dynamic-sampling-filter-path` | _(see history mode)_ | Drop groups with zero reward variance (history-based mode only) |
 | `--rollout-max-response-len` | 4096 | Max new tokens per SGLang generation call |
 | `--rollout-temperature` | 0.7 | Sampling temperature |
 | `--global-batch-size` | 64 | Samples per optimizer step |
@@ -186,6 +188,8 @@ Key args in `run_android_world.sh` / `run_android_world.py` (edit directly or ov
 | `--advantage-estimator` | grpo | RL algorithm |
 
 **How these relate**: Training runs for `num_rollout` (16) iterations. In each iteration, `rollout_batch_size` (8) unique prompts are sampled and each is expanded into `n_samples_per_prompt` (8) independent copies, launching `8 × 8 = 64` concurrent `generate()` calls (each on its own emulator). The 64 samples produced equal `global_batch_size` (64), so each iteration performs exactly 1 optimizer step.
+
+**History-based mode differences**: With `--dynamic-sampling-filter-path`, more than `rollout_batch_size` groups are attempted — `--over-sampling-batch-size 32` pre-submits 32 prompt groups per data source call, but only 16 surviving groups (those passing the filter) are used. Additionally, each trajectory produces T step-samples (not 1), so `--global-batch-size` is omitted from the history script (uses `--num-steps-per-rollout 1` with `--balance-data` instead). The total flattened sample count = `rollout_batch_size × n_samples_per_prompt × avg_trajectory_length`, trimmed to a multiple of `global_batch_size` if set.
 
 `max_context_len` (config.yaml, 16384) sets a **total token budget** for each episode. At the start of a `generate()` call the remaining budget is computed as `max_context_len - len(prompt_tokens)`. Every token produced during the episode — both model output tokens and environment observation tokens — is deducted from this budget. Before each SGLang inference call, `max_new_tokens` is clamped to the remaining budget so the model cannot overshoot. If the budget reaches zero mid-episode, the sample is marked `TRUNCATED` and the loop exits early. This is distinct from `--rollout-max-response-len`, which caps a single SGLang generation call; `max_context_len` caps the cumulative length across all turns.
 
@@ -222,7 +226,7 @@ examples/android_world/
 
 - **`rollout.py`** is the default entry point (incremental mode), specified via `--custom-generate-function-path examples.android_world.rollout.generate`. It orchestrates the multi-turn loop: pool acquisition, prompt construction, SGLang inference, env stepping, token/loss_mask management, and reward computation. Produces 1 training sample per trajectory.
 
-- **`rollout_history.py`** is the non-incremental entry point (history-based mode), specified via `--custom-generate-function-path examples.android_world.rollout_history.generate`. Each step builds a standalone prompt with full action history (using `ANDROID_WORLD_TEMPLATE`), producing T independent training samples per trajectory. Also provides `post_process_rewards_history` (wired via `--custom-reward-post-process-path`) for correct GRPO normalization with variable-length trajectories. See [Rollout Modes](#rollout-modes) for details.
+- **`rollout_history.py`** is the non-incremental entry point (history-based mode), specified via `--custom-generate-function-path examples.android_world.rollout_history.generate`. Each step builds a standalone prompt with full action history (using `ANDROID_WORLD_TEMPLATE`), producing T independent training samples per trajectory. Also provides `post_process_rewards_history` (wired via `--custom-reward-post-process-path`) for correct GRPO normalization with variable-length trajectories, and `check_reward_nonzero_std_history` (wired via `--dynamic-sampling-filter-path`) to drop zero-variance groups. See [Rollout Modes](#rollout-modes) for details.
 
 - **`env_pool.py`** manages a singleton pool of persistent `AndroidWorldWorker` Ray actors. Workers are created once (emulator boot is expensive) and reused across all training iterations. The `asyncio.Queue`-based acquire/release is safe for concurrent async generate calls.
 
@@ -244,19 +248,89 @@ Rewards are computed inside `env_worker.py`'s `step()` when the agent explicitly
 - **Thinking bonus**: Sigmoid-scaled bonus based on average thinking tokens per step
 - **Premature penalty**: Up to 0.5, proportional to how early the agent terminated
 
-### TensorBoard Reward Metrics
+### Dynamic Sampling
 
-Three reward-related metrics appear under `rollout/` in TensorBoard. They represent different processing stages of the same underlying reward:
+When `--dynamic-sampling-filter-path` is set (as in `run_android_world_history.sh`), the rollout loop filters out prompt groups before they enter the training batch. For Android World, the filter `check_reward_nonzero_std_history` drops groups where all N trajectory rewards are identical (std == 0), because those groups produce zero advantage and zero gradients.
+
+#### How the rollout loop works with filtering
+
+The rollout loop in `sglang_rollout.py` collects groups until it has `rollout_batch_size` (16) **surviving** groups:
+
+```
+target_data_size = args.rollout_batch_size  # 16 groups
+
+while len(data) < target_data_size:
+    # Request over_sampling_batch_size prompts from data source
+    samples = data_source(args.over_sampling_batch_size)  # 32 prompts
+    state.submit_generate_tasks(samples)
+
+    # Wait for completions
+    for each completed group:
+        all_data.append(group)                    # always kept (for optional post-processing)
+        if dynamic_filter(group).keep == False:
+            remaining_batch_size -= 1             # triggers more submissions
+            continue
+        data.append(group)                        # only surviving groups
+```
+
+The loop tracks `remaining_batch_size` — when a group is dropped, it decrements, which triggers more prompt submissions on the next iteration. Excess pending tasks are aborted once 16 groups survive.
+
+#### `--over-sampling-batch-size` (32)
+
+This controls how many **prompts** are requested from the data source per call (not samples). Each prompt is expanded into `n_samples_per_prompt` (8) copies. With `rollout_batch_size=16`, setting `over_sampling_batch_size=32` means each `data_source()` call pre-submits 32 prompt groups (256 sample copies). The loop only keeps 16 surviving groups and aborts the rest.
+
+The 2x ratio provides headroom for the expected filter drop rate. If ~50% of groups have uniform rewards (common in early Android World training), 32 is reasonable — submit 32, expect ~16 to survive. If the drop rate is lower, excess groups are simply aborted. The only downside is wasted rollout compute on aborted groups, which is minor compared to the latency of iterating the while loop to request more prompts one-by-one.
+
+#### Filter function signature
+
+```python
+def check_reward_nonzero_std_history(args, group, **kwargs):
+    """Each element of group is list[Sample] (one trajectory's steps).
+    Drop the group if all N trajectory rewards are identical (std == 0)."""
+    traj_rewards = [traj[0].get_reward_value(args) for traj in group]
+    keep = bool(torch.tensor(traj_rewards).std() > 0.0)
+    return DynamicFilterOutput(keep=keep, reason=f"zero_std_{round(traj_rewards[0], 1)}" if not keep else None)
+```
+
+The `reason` string (e.g., `"zero_std_0.0"`, `"zero_std_1.0"`) is passed to `MetricGatherer` and becomes part of the logged metric name — see below. Note: `float()` is applied to the reward before `round()` to ensure consistent metric names (without this, `int` rewards like `0` would produce `drop_zero_std_0` instead of `drop_zero_std_0.0`).
+
+### TensorBoard Metrics
+
+#### Reward metrics (post-filter)
+
+Three reward-related metrics appear under `rollout/` in TensorBoard. **All three are computed on post-filter samples only** — groups dropped by the dynamic sampling filter are excluded. This is correct for training (you only train on surviving groups) but means these metrics do not reflect the raw policy output distribution.
 
 | Metric | Source | Computation | Meaning |
 |--------|--------|-------------|---------|
-| `rollout/raw_reward` | `rollout_data["raw_reward"]` | Simple average across samples | Original shaped reward from `env.get_reward()`, before any normalization |
-| `rollout/rewards` | `rollout_data["rewards"]` | Simple average across samples | Reward after GRPO group normalization (mean-subtracted, optionally std-divided within each group of `n_samples_per_prompt`) |
-| `rollout/returns` | `rollout_data["returns"]` | Loss-mask-weighted average, gathered across DP ranks | GRPO-normalized reward broadcast to every response token, then weighted by `loss_mask` (so observation tokens with mask=0 are excluded and longer responses contribute more) |
+| `rollout/raw_reward` | `rollout_data["raw_reward"]` | Simple average across samples | Original shaped reward from `env.get_reward()`, before any normalization. **Post-filter**: groups with uniform rewards (e.g., all-zero) are excluded, so this value is biased upward. |
+| `rollout/rewards` | `rollout_data["rewards"]` | Simple average across samples | Reward after GRPO group normalization (mean-subtracted, optionally std-divided within each group of `n_samples_per_prompt`). Post-filter. |
+| `rollout/returns` | `rollout_data["returns"]` | Loss-mask-weighted average, gathered across DP ranks | GRPO-normalized reward broadcast to every response token, then weighted by `loss_mask`. Post-filter. |
 
-For GRPO, `returns = advantages = normalized_reward` repeated for each response token (`slime/backends/megatron_utils/loss.py`). The `rollout/returns` logging weights each sample by its loss-mask sum, while `rollout/rewards` weights all samples equally — this is why the two differ even though they derive from the same normalized values.
+For GRPO, `returns = advantages = normalized_reward` repeated for each response token (`slime/backends/megatron_utils/loss.py`). The `rollout/returns` logging weights each sample by its loss-mask sum, while `rollout/rewards` weights all samples equally — this is why the two can differ even though they derive from the same normalized values. In practice, they differ only when `loss_mask` contains zeros (e.g., incremental mode where observation tokens have `mask=0`).
 
-**History-based mode note**: In history-based rollout, the custom `post_process_rewards_history` function controls how `rollout/rewards` and `rollout/returns` are computed. `rollout/raw_reward` is unaffected (always the original `env.get_reward()` value, averaged across all step-samples — longer trajectories contribute more step-samples, so this metric is biased toward them, but it is logging-only and does not affect training). `rollout/rewards` reflects per-prompt, per-trajectory normalization: each trajectory gets equal weight regardless of step count, and different prompts are never mixed. `rollout/returns` inherits from `rollout/rewards` — the normalized scalar is broadcast to every response token via `get_grpo_returns`, so the policy gradient correctly up-weights trajectories that outperform their per-prompt peers.
+**History-based mode note**: In history-based rollout, `rollout/rewards` and `rollout/returns` will be **identical**. This is expected: each step-sample has `loss_mask = [1] * response_length` (all ones, no observation tokens), so the loss-mask-weighted average in `rollout/returns` degenerates to a simple average — the same computation as `rollout/rewards`. The custom `post_process_rewards_history` function controls how both are computed: it groups samples by `group_index` (prompt), normalizes across N trajectories per prompt with equal weight per trajectory regardless of step count, and broadcasts the result to all step-samples. `rollout/raw_reward` is unaffected (always the original `env.get_reward()` value, averaged across all step-samples — longer trajectories contribute more step-samples to this average, but it is logging-only and does not affect training).
+
+#### Dynamic filter metrics
+
+When `--dynamic-sampling-filter-path` is set, the `MetricGatherer` tracks drop counts and logs them via `rollout_extra_metrics` at the rollout actor level (`ray/rollout.py:1161`). These appear in TensorBoard as:
+
+| Metric | Meaning |
+|--------|---------|
+| `rollout/dynamic_filter/drop_zero_std_0.0` | Number of groups dropped because all N trajectories scored 0.0 (all-fail) |
+| `rollout/dynamic_filter/drop_zero_std_1.0` | Number of groups dropped because all N trajectories scored ~1.0 (all-succeed) |
+
+These counts are per-rollout-iteration. A high `drop_zero_std_0.0` early in training is expected (many tasks are too hard initially). As training progresses, expect `drop_zero_std_0.0` to decrease and `drop_zero_std_1.0` to increase (tasks become "solved" and all N trajectories succeed).
+
+#### Interpreting metrics with filtering enabled
+
+Because `rollout/raw_reward` is post-filter, it does **not** represent the true policy success rate. To estimate the actual success rate, combine it with the filter drop counts:
+
+```
+total_groups_attempted = rollout_batch_size + drop_zero_std_0.0 + drop_zero_std_1.0
+pre_filter_success_rate ≈ (rollout/raw_reward * rollout_batch_size + 1.0 * drop_zero_std_1.0) / total_groups_attempted
+```
+
+This is approximate because `raw_reward` includes step-shaping (not exactly 0 or 1), but it gives a rough picture. The `rollout/zero_std/*` metrics (logged separately by `compute_metrics_from_samples` on the rollout side) count zero-std groups **within the surviving batch** — these should be zero when the dynamic filter is active, since the filter removes them before they reach the batch.
 
 ## Token and Loss Mask Layout
 
@@ -290,6 +364,8 @@ Each turn is an **independent** training sample: the prompt is rebuilt from scra
 ```
 --custom-generate-function-path examples.android_world.rollout_history.generate
 --custom-reward-post-process-path examples.android_world.rollout_history.post_process_rewards_history
+--dynamic-sampling-filter-path examples.android_world.rollout_history.check_reward_nonzero_std_history
+--over-sampling-batch-size 32
 ```
 
 **Launch script:**
@@ -345,6 +421,7 @@ There is no cross-turn accumulated budget. If a step's prompt exceeds `max_conte
 | SGLang calls per T-step trajectory | T (incremental, cached) | T (independent, no cache reuse) |
 | Token budget | Global across all turns | Independent per step |
 | GRPO reward normalization | Default `_post_process_rewards` (reshape works because 1 sample per trajectory) | Custom `post_process_rewards_history` (groups by prompt, normalizes per-trajectory) |
+| Dynamic sampling filter | Not needed (1 sample/trajectory, default reshape handles it) | `check_reward_nonzero_std_history` drops zero-variance groups; `--over-sampling-batch-size 32` provides filter headroom |
 | Matching RL method | Custom multi-turn RL | R1-V / InternVL-RL style VLM RL |
 
 #### GRPO with history-based rollout
@@ -365,6 +442,18 @@ The `--custom-reward-post-process-path examples.android_world.rollout_history.po
 5. Broadcasting the normalized reward back to every step-sample in each trajectory
 
 This ensures each trajectory contributes equally to the gradient regardless of step count, and different prompts are never mixed during normalization.
+
+#### Dynamic sampling filter
+
+With `--dynamic-sampling-filter-path examples.android_world.rollout_history.check_reward_nonzero_std_history`, prompt groups where all N trajectories have the same reward are dropped before entering the training batch. This is important because:
+
+- **Zero-variance groups produce zero advantages** (GRPO mean-subtraction yields 0 for all), which means zero gradients for those samples
+- **Zero gradients can cause NaN** in some optimizer configurations, particularly with gradient clipping or mixed precision
+- **Wasted compute**: training on zero-gradient samples provides no learning signal but consumes GPU time
+
+The filter operates at the group level (one group = N trajectory copies of a single prompt). In early training, many groups will be all-fail (`reward ≈ 0` for all N), and late in training, some groups will be all-succeed (`reward ≈ 1` for all N). Both are dropped.
+
+See [Dynamic Sampling](#dynamic-sampling) for the full mechanism and [TensorBoard Metrics](#tensorboard-metrics) for how to monitor filter activity.
 
 ## Verification Tests
 
