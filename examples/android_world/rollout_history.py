@@ -305,8 +305,11 @@ def post_process_rewards_history(args, samples: list[Sample]) -> tuple[list[floa
         tr = torch.tensor(traj_rewards, dtype=torch.float)
         tr = tr - tr.mean()
         if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
-            std = tr.std()
-            tr = tr / (std + 1e-6)
+            # std() with Bessel correction on a single element returns nan;
+            # guard against this (can happen when trimming splits a group)
+            if len(tr) > 1:
+                std = tr.std()
+                tr = tr / (std + 1e-6)
 
         # Broadcast normalized reward back to all step-samples in each trajectory
         for norm_reward, positions in zip(tr.tolist(), traj_positions):

@@ -202,6 +202,32 @@ class TestPostProcessRewardsHistory:
         assert abs(normalized[0]) < 1e-5
         assert abs(normalized[1]) < 1e-5
 
+    def test_single_trajectory_with_std_normalization_no_nan(self):
+        """Single trajectory with grpo_std_normalization=True must not produce NaN.
+
+        torch.std() with Bessel correction on a single element returns NaN
+        (division by N-1=0). This can happen after trimming splits a group,
+        leaving only one trajectory's step-samples. The function must guard
+        against this and return 0.0 (not NaN).
+        """
+        func = _import_func()
+        args = _make_args(grpo_std_normalization=True)
+
+        samples = [
+            _make_sample(group_index=0, index=0, reward=5.0),
+            _make_sample(group_index=0, index=0, reward=5.0),  # same traj, step 2
+            _make_sample(group_index=0, index=0, reward=5.0),  # same traj, step 3
+        ]
+
+        raw, normalized = func(args, samples)
+
+        # Must not be NaN
+        import math
+
+        assert not any(math.isnan(v) for v in normalized), f"Got NaN in normalized rewards: {normalized}"
+        # Only 1 trajectory, mean-subtracted = 0.0, std skipped
+        assert all(abs(v) < 1e-5 for v in normalized)
+
     def test_reinforce_plus_plus_baseline(self):
         """reinforce_plus_plus_baseline estimator also triggers normalization."""
         func = _import_func()
@@ -294,6 +320,26 @@ class TestCheckRewardNonzeroStdHistory:
         result = filt(args, group)
         assert result.keep is False
         assert result.reason == "zero_std_0.0"
+
+    def test_int_reward_produces_consistent_metric_name(self):
+        """Integer reward 0 should produce 'zero_std_0.0' (not 'zero_std_0').
+
+        env.get_reward() may return int 0 for timeout cases. Without float()
+        cast, round(0, 1) -> 0 (int) and the metric name becomes
+        'drop_zero_std_0' instead of 'drop_zero_std_0.0', splitting what
+        should be a single metric into two buckets.
+        """
+        filt = self._import_filter()
+        args = _make_args()
+
+        group = [
+            [_make_sample(0, 0, reward=0)],   # int 0, not float 0.0
+            [_make_sample(0, 1, reward=0)],
+        ]
+
+        result = filt(args, group)
+        assert result.keep is False
+        assert result.reason == "zero_std_0.0", f"Expected 'zero_std_0.0' but got '{result.reason}'"
 
     def test_handles_flat_samples_in_group(self):
         """Falls back to flat Sample elements (not wrapped in list)."""

@@ -443,6 +443,8 @@ The `--custom-reward-post-process-path examples.android_world.rollout_history.po
 
 This ensures each trajectory contributes equally to the gradient regardless of step count, and different prompts are never mixed during normalization.
 
+**Trimming edge case**: After flattening, the total sample count is trimmed to a multiple of `global_batch_size` by chopping trailing samples (`ray/rollout.py:528`). This can split the last group, leaving only a subset of its trajectories' step-samples. If only 1 trajectory survives trimming for a group, `torch.std()` with Bessel correction (default `ddof=1`) returns `nan` (division by `N-1 = 0`). `post_process_rewards_history` guards against this by skipping std normalization when `len(traj_rewards) <= 1`. In that case, mean-subtraction of a single value yields `0.0`, which is correct (a single trajectory provides no contrastive signal).
+
 #### Dynamic sampling filter
 
 With `--dynamic-sampling-filter-path examples.android_world.rollout_history.check_reward_nonzero_std_history`, prompt groups where all N trajectories have the same reward are dropped before entering the training batch. This is important because:
