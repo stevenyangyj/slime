@@ -67,7 +67,7 @@ def check_reward_nonzero_std_history(args, group, **kwargs):
         else:
             traj_rewards.append(traj.get_reward_value(args))
 
-    keep = bool(torch.tensor(traj_rewards, dtype=torch.float).std() > 0.0)
+    keep = torch.tensor(traj_rewards, dtype=torch.float64).std() > 1e-6
     return DynamicFilterOutput(
         keep=keep,
         reason=None if keep else f"zero_std_{round(float(traj_rewards[0]), 1)}",
