@@ -120,7 +120,7 @@ ROLLOUT_ARGS=(
    --rollout-batch-size 16
    --over-sampling-batch-size 32
    --n-samples-per-prompt 8
-   --rollout-max-response-len 4096
+   --rollout-max-response-len 1024
    --rollout-temperature 0.7
    --num-steps-per-rollout 1
    # --global-batch-size 16
@@ -135,6 +135,7 @@ GRPO_ARGS=(
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
+   --use-tis
 )
 
 OPTIMIZER_ARGS=(
